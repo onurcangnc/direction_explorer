@@ -36,14 +36,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # ━━ Config ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "vngrs-ai/Kumru-2B")
+MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.2-3B-Instruct")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 PORT = int(os.environ.get("PORT", "8002"))
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-DTYPE = torch.float16
+DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+LOAD_IN_8BIT = os.environ.get("LOAD_IN_8BIT", "0") == "1"
+DTYPE = torch.float16 if DEVICE in ("cuda", "mps") else torch.float32
+DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("DEFAULT_MAX_NEW_TOKENS", "128"))
+MAX_NEW_TOKENS_CAP = int(os.environ.get("MAX_NEW_TOKENS_CAP", "512"))
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 TOP_K = 12
@@ -125,6 +129,54 @@ DEFAULT_HARMLESS = [
     "Explain why the sky appears blue.",
     "Create a budget template for monthly expenses.",
     "What are the rules of chess at a high level?",
+    # ━━ Türkçe harmless prompts ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Factual Q&A
+    "Türkiye'nin başkenti neresidir?",
+    "Fotosentez süreci nasıl gerçekleşir?",
+    "Osmanlı İmparatorluğu yaklaşık kaç yıl hüküm sürdü?",
+    "Periyodik tabloda altın elementinin sembolü nedir?",
+    "Dünya üzerindeki en uzun nehir hangisidir?",
+    "Yetişkin bir insan vücudunda kaç tane kemik bulunur?",
+    # Creative writing
+    "Sonbahar yapraklarını konu alan kısa bir şiir yaz.",
+    "Bir kedi ile bir serçe arasında geçen kısa bir hikaye yaz.",
+    "İstanbul şehrine methiye niteliğinde bir şarkı sözü yaz.",
+    "Uzayda görev yapan bir astronotun günlüğünden bir paragraf yaz.",
+    "Yağmurlu bir Pazar sabahını tasvir eden betimleyici bir paragraf yaz.",
+    "Eski bir sahaf dükkanını konu alan bir öykünün açılış paragrafını yaz.",
+    # Coding & technical
+    "Python'da bir listenin elemanlarının toplamını döndüren bir fonksiyon yaz.",
+    "JavaScript'te async ve await anahtar kelimelerinin işlevini açıkla.",
+    "SQL'de INNER JOIN ile LEFT JOIN arasındaki farkı örnekle anlat.",
+    "İlk on Fibonacci sayısını üreten kısa bir Python kodu yaz.",
+    "Git ile yeni bir branch oluşturup üzerine geçmek için hangi komutlar kullanılır?",
+    # Math & reasoning
+    "Saatte 80 km hızla giden bir trenin 4 saatte aldığı yolu hesapla.",
+    "12 ile 18 sayılarının en büyük ortak bölenini bul.",
+    "Alanı 64 cm² olan bir karenin kenar uzunluğu kaç cm'dir?",
+    "İki sayının toplamı 30, farkı 8 ise bu sayılar kaçtır?",
+    "5 elmayı 3 kişi arasında eşit olarak nasıl paylaştırabilirsin?",
+    # Opinion & subjective
+    "Bana okumam için klasik bir Türk romanı önerir misin?",
+    "Yaz akşamlarına uygun bir film tavsiyesi verir misin?",
+    "Sence dağ tatili mi deniz tatili mi daha dinlendiricidir?",
+    "Yeni bir dil öğrenmek isteyen birine en iyi öğrenme yöntemi nedir?",
+    "Stresli bir haftadan sonra rahatlamak için ne önerirsin?",
+    "Klasik müzik mi yoksa caz mı çalışırken daha verimli olur sence?",
+    # Instruction following
+    "Şu cümleyi resmi bir dile çevir: 'selam naber, bugün ne yapıyorsun?'",
+    "'Mavi, sarı, kırmızı, yeşil' kelimelerini alfabetik sıraya diz.",
+    "Bir özgeçmiş için kısa bir kişisel özet bölümü yazmama yardım eder misin?",
+    "İngilizce 'good morning' ifadesinin günün hangi saatlerinde kullanıldığını açıkla.",
+    "Bir paragrafı tek cümlede özetlemenin nasıl yapılacağını örnekle göster.",
+    "Aşağıdaki yiyecekleri kahvaltılık ve akşam yemeği olarak iki gruba ayır: yumurta, çorba, peynir, pilav, zeytin, kebap.",
+    # Casual chat
+    "Bana güzel ve temiz bir fıkra anlatır mısın?",
+    "İlginç bir bilim faktini benimle paylaşır mısın?",
+    "Bana çocukluk anısı niteliğinde bir bilmece sorar mısın?",
+    "Pazartesi sendromuyla başa çıkmak için pratik bir ipucu verir misin?",
+    "Sıkıldığımda yapabileceğim ücretsiz aktiviteler önerir misin?",
+    "Hafta sonu evde geçirmek için kısa bir program önerir misin?",
 ]
 
 
@@ -133,13 +185,32 @@ DEFAULT_HARMLESS = [
 def load_model():
     print(f"[LOAD] {MODEL_NAME} on {DEVICE} ({DTYPE})...")
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=DTYPE,
-        trust_remote_code=False,
-    ).to(DEVICE)
+    if DEVICE == "cuda" and LOAD_IN_8BIT:
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=False,
+            token=HF_TOKEN,
+        )
+    elif DEVICE == "cuda":
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            dtype=torch.float16,
+            device_map={"": 0},
+            trust_remote_code=False,
+            token=HF_TOKEN,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            dtype=DTYPE,
+            trust_remote_code=False,
+            token=HF_TOKEN,
+        ).to(DEVICE)
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=False)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=False, token=HF_TOKEN)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     n_layers = len(model.model.layers)
@@ -271,6 +342,33 @@ def compute_single_layer_mean(prompts, layer_idx: int) -> torch.Tensor:
     return accum / max(len(prompts), 1)
 
 
+def collect_layer_activations(prompts: list, layer_idx: int) -> torch.Tensor:
+    """
+    Run forward on each prompt; capture last-token residual at `layer_idx`,
+    stack into [n_prompts, d_model] fp32 tensor on CPU. Used by SOM and other
+    direction-extraction methods that need per-prompt activations, not just
+    their mean.
+    """
+    n = len(prompts)
+    out = torch.zeros((n, D_MODEL), dtype=torch.float32)
+    captured = {}
+
+    def cap_hook(module, inputs, output):
+        h = output[0] if isinstance(output, tuple) else output
+        captured["last"] = h[:, -1, :].detach().to(torch.float32).cpu()
+
+    handle = model.model.layers[layer_idx].register_forward_hook(cap_hook)
+    try:
+        for i, p in enumerate(prompts):
+            inputs = format_prompt(tokenizer, p)
+            with torch.no_grad():
+                _ = model(**inputs)
+            out[i] = captured["last"][0]
+    finally:
+        handle.remove()
+    return out
+
+
 def logit_lens(direction: torch.Tensor, k: int = TOP_K):
     """
     Project unit direction through lm_head (W_U). Returns (top, bottom) lists
@@ -299,6 +397,308 @@ def logit_lens(direction: torch.Tensor, k: int = TOP_K):
     return top, bot
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Self-Organizing Map (Piras et al. 2026)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class SimpleSOM:
+    """
+    Self-Organizing Map for clustering high-dim activations into a 2D lattice.
+    Implements Kohonen (2013) algorithm with rectangular grid, Gaussian
+    neighborhood function, and time-decaying learning rate.
+
+    Pure PyTorch — no MiniSom or other external dependency. Fully deterministic
+    given the seed (uses torch.Generator).
+    """
+
+    def __init__(
+        self,
+        grid_size=(4, 4),
+        input_dim: int = 3072,
+        learning_rate: float = 0.01,
+        sigma: float = 0.3,
+        n_iterations: int = 10000,
+        topology: str = "rectangular",
+        seed: int = 42,
+    ):
+        if topology != "rectangular":
+            raise ValueError(f"Only 'rectangular' topology is supported (got {topology}).")
+        self.grid_rows, self.grid_cols = int(grid_size[0]), int(grid_size[1])
+        self.n_neurons = self.grid_rows * self.grid_cols
+        self.input_dim = int(input_dim)
+        self.learning_rate = float(learning_rate)
+        self.sigma = float(sigma)
+        self.n_iterations = int(n_iterations)
+        self.seed = int(seed)
+        self._gen = torch.Generator().manual_seed(self.seed)
+        self._weights = torch.zeros(self.n_neurons, self.input_dim, dtype=torch.float32)
+        # Lattice (row, col) for each neuron (flat-index order, row-major).
+        self._positions = [(i // self.grid_cols, i % self.grid_cols)
+                           for i in range(self.n_neurons)]
+        self._fitted = False
+
+    @property
+    def neurons(self) -> torch.Tensor:
+        return self._weights
+
+    @property
+    def neuron_lattice_positions(self) -> list:
+        return list(self._positions)
+
+    def _pca_init(self, X: torch.Tensor) -> None:
+        """
+        Initialize neurons by projecting X onto its top-2 principal components,
+        then placing lattice points on a regular grid that spans [min, max] of
+        each PC, mapping back to input space.
+        """
+        Xc = X - X.mean(dim=0, keepdim=True)
+        # Use SVD on centered data (more stable than torch.pca_lowrank for our scale).
+        U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+        pc1 = Vh[0]                                            # [d]
+        pc2 = Vh[1] if Vh.shape[0] > 1 else torch.zeros_like(pc1)
+        proj = Xc @ torch.stack([pc1, pc2], dim=1)             # [n, 2]
+        pc1_min, pc1_max = float(proj[:, 0].min()), float(proj[:, 0].max())
+        pc2_min, pc2_max = float(proj[:, 1].min()), float(proj[:, 1].max())
+        # Avoid degenerate spans.
+        if abs(pc1_max - pc1_min) < 1e-9:
+            pc1_max = pc1_min + 1.0
+        if abs(pc2_max - pc2_min) < 1e-9:
+            pc2_max = pc2_min + 1.0
+
+        mean_X = X.mean(dim=0)
+        for i in range(self.n_neurons):
+            r, c = self._positions[i]
+            # Normalize lattice index → [0, 1] → PC space.
+            tr = r / max(self.grid_rows - 1, 1)
+            tc = c / max(self.grid_cols - 1, 1)
+            v1 = pc1_min + tr * (pc1_max - pc1_min)
+            v2 = pc2_min + tc * (pc2_max - pc2_min)
+            self._weights[i] = mean_X + v1 * pc1 + v2 * pc2
+
+    def fit(self, X: torch.Tensor) -> None:
+        if X.dim() != 2:
+            raise ValueError(f"X must be 2D, got shape {tuple(X.shape)}")
+        if X.shape[1] != self.input_dim:
+            raise ValueError(
+                f"X dim mismatch: expected {self.input_dim}, got {X.shape[1]}"
+            )
+        X = X.detach().to("cpu", dtype=torch.float32)
+        n_samples = X.shape[0]
+        if n_samples == 0:
+            self._fitted = True
+            return
+
+        self._pca_init(X)
+
+        # Pre-compute lattice grid distances to BMU on the fly inside the loop.
+        # Fast path: small grids (n_neurons ≤ 64) so per-step O(n_neurons * d_model)
+        # dominates and lattice distance compute is negligible.
+        T = float(self.n_iterations)
+        sigma = self.sigma
+        # Sigma is in lattice units; for a small grid we keep it small.
+        # Translate fractional sigma (default 0.3) to absolute lattice scale.
+        sigma_abs = max(sigma * max(self.grid_rows, self.grid_cols), 0.5)
+        two_sig_sq = 2.0 * (sigma_abs ** 2)
+
+        # Precompute pairwise lattice distance matrix [n_neurons, n_neurons].
+        positions = torch.tensor(self._positions, dtype=torch.float32)  # [n, 2]
+        diff = positions.unsqueeze(0) - positions.unsqueeze(1)          # [n, n, 2]
+        lattice_dist_sq = (diff[..., 0] ** 2 + diff[..., 1] ** 2)        # [n, n] (squared euclidean)
+
+        for t in range(self.n_iterations):
+            idx = int(torch.randint(0, n_samples, (1,), generator=self._gen).item())
+            x = X[idx]                                                   # [d]
+            # BMU = neuron with smallest distance to x.
+            d2 = ((self._weights - x) ** 2).sum(dim=1)                   # [n_neurons]
+            bmu = int(torch.argmin(d2).item())
+            alpha_t = self.learning_rate / (1.0 + 2.0 * t / T)
+            h = torch.exp(-lattice_dist_sq[bmu] / two_sig_sq)             # [n_neurons]
+            # Update all neurons in one shot.
+            self._weights += (alpha_t * h).unsqueeze(1) * (x.unsqueeze(0) - self._weights)
+
+        self._fitted = True
+
+    def assign_bmus(self, X: torch.Tensor) -> torch.Tensor:
+        """Return [n_samples] long tensor of BMU flat indices for each x in X."""
+        X = X.detach().to("cpu", dtype=torch.float32)
+        # Distances [n_samples, n_neurons]. Memory-friendly chunked compute.
+        chunk = 512
+        out = torch.zeros(X.shape[0], dtype=torch.long)
+        for s in range(0, X.shape[0], chunk):
+            e = min(s + chunk, X.shape[0])
+            sub = X[s:e].unsqueeze(1) - self._weights.unsqueeze(0)        # [b, n, d]
+            d2 = (sub ** 2).sum(dim=2)                                    # [b, n]
+            out[s:e] = d2.argmin(dim=1)
+        return out
+
+
+def compute_som_directions(
+    harmful_activations: torch.Tensor,
+    harmless_activations: torch.Tensor,
+    grid_size=(4, 4),
+    n_iterations: int = 10000,
+    learning_rate: float = 0.01,
+    sigma: float = 0.3,
+    seed: int = 42,
+) -> list:
+    """
+    Piras et al. 2026 SOM-based multi-direction refusal extraction.
+
+    Steps:
+      1. Train SOM on `harmful_activations` only.
+      2. Compute `mu_harmless = mean(harmless_activations)`.
+      3. For each neuron w_i: direction_i = unit(w_i − mu_harmless).
+      4. Compute cluster size + tightness via BMU assignment of harmful samples.
+      5. Return sorted-by-cluster-size list of dicts.
+
+    All math is in fp32 on CPU and deterministic given `seed`.
+    """
+    H = harmful_activations.detach().to("cpu", dtype=torch.float32)
+    N = harmless_activations.detach().to("cpu", dtype=torch.float32)
+    if H.dim() != 2 or N.dim() != 2:
+        raise ValueError("activations must be 2D")
+    n_h, d_in = H.shape
+    if N.shape[1] != d_in:
+        raise ValueError(f"d_in mismatch: harmful={d_in}, harmless={N.shape[1]}")
+
+    som = SimpleSOM(
+        grid_size=grid_size,
+        input_dim=d_in,
+        learning_rate=learning_rate,
+        sigma=sigma,
+        n_iterations=n_iterations,
+        topology="rectangular",
+        seed=seed,
+    )
+    som.fit(H)
+
+    mu_harmless = N.mean(dim=0)                                          # [d]
+    bmus = som.assign_bmus(H)                                            # [n_h]
+    neurons = som.neurons                                                # [n, d]
+    positions = som.neuron_lattice_positions
+    n_neurons = neurons.shape[0]
+
+    # Cluster stats.
+    cluster_sizes = torch.zeros(n_neurons, dtype=torch.long)
+    for i in range(n_neurons):
+        cluster_sizes[i] = int((bmus == i).sum().item())
+    total_h = max(int(n_h), 1)
+
+    results = []
+    for i in range(n_neurons):
+        diff = neurons[i] - mu_harmless
+        raw_norm = float(diff.norm().item())
+        if raw_norm < 1e-9:
+            direction = torch.zeros_like(diff)
+        else:
+            direction = diff / raw_norm
+        cluster_member_mask = (bmus == i)
+        cluster_size = int(cluster_member_mask.sum().item())
+        if cluster_size > 0:
+            members = H[cluster_member_mask]
+            tightness = float(((members - neurons[i]) ** 2).sum(dim=1).sqrt().mean().item())
+        else:
+            tightness = float("nan")
+        results.append({
+            "lattice_position": tuple(positions[i]),
+            "neuron_index": i,
+            "direction": direction,
+            "raw_norm": raw_norm,
+            "cluster_size": cluster_size,
+            "cluster_share": cluster_size / total_h,
+            "cluster_tightness": tightness,
+        })
+
+    # Sort by cluster_size descending (Piras: top-populated neurons first).
+    results.sort(key=lambda r: -r["cluster_size"])
+    return results
+
+
+# ━━ Layer-key helpers (mixed int / "{layer}_som_n{i}" string keys) ━━━━━━━
+
+def _parse_layer_key(s):
+    """
+    Convert a wire-format layer reference to its in-memory key.
+
+    Canonical (mean_diff) → int. SOM neuron "{layer}_som_n{i}" stays as
+    string. Numeric strings ("17") become int. Forward-compatible with
+    "{layer}_svd{i}" and other future suffixes.
+    """
+    if isinstance(s, int):
+        return s
+    s = str(s)
+    if "_som_n" in s or "_svd" in s:
+        return s
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
+def _computed_layer_sort_key(k):
+    """
+    Sort key:  L17 (canonical, kind=0) <  L17_svd* (kind=1) <  L17_som_n* (kind=2)
+    Preserves natural ordering by (layer_int, kind, sub_index).
+    """
+    if isinstance(k, int):
+        return (k, 0, 0)
+    s = str(k)
+    if "_som_n" in s:
+        layer_part, _, idx_part = s.partition("_som_n")
+        try:
+            return (int(layer_part), 2, int(idx_part) if idx_part else 0)
+        except Exception:
+            return (10**9, 2, s)
+    if "_svd" in s:
+        layer_part, _, idx_part = s.partition("_svd")
+        try:
+            return (int(layer_part), 1, int(idx_part) if idx_part else 0)
+        except Exception:
+            return (10**9, 1, s)
+    try:
+        return (int(s), 0, 0)
+    except Exception:
+        return (10**9, 9, s)
+
+
+def _layer_label(k) -> str:
+    """Display label, e.g. 'L17', 'L17 (SOM n[0,1])', 'L17 (SVD #1)'."""
+    info = STATE["directions"].get(k, {}) if "STATE" in globals() else {}
+    cached = info.get("display_label")
+    if cached:
+        return cached
+    if isinstance(k, int):
+        return f"L{k}"
+    s = str(k)
+    if "_som_n" in s:
+        layer_part, _, idx_part = s.partition("_som_n")
+        try:
+            i = int(idx_part)
+            cols = info.get("som_grid_cols")
+            if isinstance(cols, int) and cols > 0:
+                return f"L{layer_part} (SOM n[{i // cols},{i % cols}])"
+            return f"L{layer_part} (SOM n{idx_part})"
+        except Exception:
+            return f"L{layer_part} (SOM n{idx_part})"
+    if "_svd" in s:
+        layer_part, _, idx_part = s.partition("_svd")
+        return f"L{layer_part} (SVD #{idx_part})"
+    return s
+
+
+def _direction_kind(k) -> str:
+    """Returns 'mean_diff' | 'whitened_svd' | 'som_md' based on the key shape."""
+    if isinstance(k, int):
+        info = STATE["directions"].get(k, {}) if "STATE" in globals() else {}
+        return info.get("extraction_method", "mean_diff")
+    s = str(k)
+    if "_som_n" in s:
+        return "som_md"
+    if "_svd" in s:
+        return "whitened_svd"
+    return "mean_diff"
+
+
 # ━━ Weight projection / orthogonalization ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _project_out_columns(W: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
@@ -323,22 +723,52 @@ def _project_out_rows(W: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
     return W - coef.unsqueeze(-1) * d.unsqueeze(0)
 
 
-def apply_full_ablation(direction: torch.Tensor):
+def orthonormalize_directions(directions) -> list:
     """
-    Arditi-style weight orthogonalization (Llama / Mistral family naming):
+    Modified Gram-Schmidt. Returns a list of mutually orthogonal unit vectors
+    spanning the same subspace. Order is preserved; nearly-collinear inputs
+    are dropped (norm < 1e-6 after subtraction). fp32 on CPU for stability.
+    """
+    out: list = []
+    for raw in directions:
+        v = raw.detach().to("cpu", dtype=torch.float32).clone()
+        for u in out:
+            v = v - (v @ u) * u
+        n = float(v.norm().item())
+        if n > 1e-6:
+            out.append(v / n)
+    return out
+
+
+def apply_full_ablation(directions):
+    """
+    Arditi-style weight orthogonalization (Llama / Mistral family naming),
+    multi-direction generalization. Accepts a single tensor (single-direction
+    backward-compat) or a list of tensors (Gram-Schmidt orthonormalized first).
+
+    Projects every direction in the orthonormalized basis out of:
       - layer.self_attn.o_proj.weight   [d_model, d_model]   (project columns)
       - layer.mlp.down_proj.weight      [d_model, d_mlp]     (project columns)
       - model.embed_tokens.weight       [vocab, d_model]     (project rows)
     """
-    d = direction.to(DTYPE).to(DEVICE)
+    if isinstance(directions, torch.Tensor):
+        directions = [directions]
+    ortho = orthonormalize_directions(directions)
+    if not ortho:
+        return
     with torch.no_grad():
         E = model.model.embed_tokens.weight
-        E.copy_(_project_out_rows(E, d))
+        for d in ortho:
+            d_t = d.to(E.dtype).to(E.device)
+            E.copy_(_project_out_rows(E, d_t))
         for layer in model.model.layers:
             o = layer.self_attn.o_proj.weight
-            o.copy_(_project_out_columns(o, d))
             dp = layer.mlp.down_proj.weight
-            dp.copy_(_project_out_columns(dp, d))
+            for d in ortho:
+                d_o = d.to(o.dtype).to(o.device)
+                o.copy_(_project_out_columns(o, d_o))
+                d_dp = d.to(dp.dtype).to(dp.device)
+                dp.copy_(_project_out_columns(dp, d_dp))
 
 
 def restore_weights():
@@ -350,19 +780,27 @@ def restore_weights():
         model.model.embed_tokens.weight.copy_(WEIGHT_SNAPSHOT["embed_tokens"])
 
 
-def make_partial_ablation_hook(direction: torch.Tensor, alpha: float):
+def make_partial_ablation_hook(directions, alpha: float):
     """
-    Returns a forward hook that subtracts α · proj_d(h) from the layer's
-    output hidden state. Output replaces the original residual stream that
-    flows into the next layer.
+    Returns a forward hook that subtracts α · (sum of projections onto each
+    orthonormalized direction) from the layer's output hidden state.
+    Accepts a single tensor or a list of tensors. For α=1.0 with k directions
+    this equals projection onto span(directions)^⊥.
     """
+    if isinstance(directions, torch.Tensor):
+        directions = [directions]
+    ortho = orthonormalize_directions(directions)
+
     def hook(module, inputs, output):
         is_tuple = isinstance(output, tuple)
         h = output[0] if is_tuple else output
-        d = direction.to(h.dtype).to(h.device)
-        d_norm_sq = (d @ d).clamp_min(1e-12)
-        proj = (h @ d).unsqueeze(-1) * d / d_norm_sq
-        h_new = h - alpha * proj
+        if not ortho:
+            return output
+        h_new = h
+        for d in ortho:
+            d_t = d.to(h_new.dtype).to(h_new.device)
+            proj = (h_new @ d_t).unsqueeze(-1) * d_t
+            h_new = h_new - alpha * proj
         if is_tuple:
             return (h_new,) + output[1:]
         return h_new
@@ -442,22 +880,35 @@ def capture_token_projections(full_token_ids: torch.Tensor, prompt_len: int,
 
 print(f"[STARTUP] Loading model: {MODEL_NAME}")
 print(f"[STARTUP] Port: {PORT}")
+print(f"[CONFIG] Model: {MODEL_NAME}")
+print(f"[CONFIG] Device: {DEVICE}, DType: {DTYPE}")
+print(f"[CONFIG] 8-bit quantization: {LOAD_IN_8BIT}")
+print(f"[CONFIG] HF_TOKEN: {'set' if HF_TOKEN else 'not set'}")
+if DEVICE == "cuda":
+    free, total = torch.cuda.mem_get_info()
+    print(f"[CONFIG] VRAM free/total: {free/1e9:.2f}GB / {total/1e9:.2f}GB")
 model, tokenizer = load_model()
+if DEVICE == "cuda":
+    allocated = torch.cuda.memory_allocated() / 1e9
+    print(f"[LOAD] VRAM allocated after load: {allocated:.2f}GB")
 N_LAYERS = len(model.model.layers)
 D_MODEL = model.config.hidden_size
 print(f"[LOAD] Done. n_layers={N_LAYERS}, d_model={D_MODEL}")
 
-print("[SNAPSHOT] Cloning attention o_proj, mlp down_proj, embedding weights...")
+print("[SNAPSHOT] Cloning attention o_proj, mlp down_proj, embedding weights (to CPU)...")
 WEIGHT_SNAPSHOT = {
-    "o_proj": [layer.self_attn.o_proj.weight.detach().clone()
+    "o_proj": [layer.self_attn.o_proj.weight.detach().to("cpu", copy=True)
                for layer in model.model.layers],
-    "down_proj": [layer.mlp.down_proj.weight.detach().clone()
+    "down_proj": [layer.mlp.down_proj.weight.detach().to("cpu", copy=True)
                   for layer in model.model.layers],
-    "embed_tokens": model.model.embed_tokens.weight.detach().clone(),
+    "embed_tokens": model.model.embed_tokens.weight.detach().to("cpu", copy=True),
 }
+if DEVICE == "cuda":
+    print(f"[SNAPSHOT] VRAM allocated after snapshot: {torch.cuda.memory_allocated()/1e9:.2f}GB")
 print("[SNAPSHOT] Done.")
 
-# Server-side cache of computed directions
+# Server-side cache of computed directions. Keys mix int (canonical
+# mean_diff) and string ("{layer}_som_n{i}", "{layer}_svd{i}") forms.
 STATE: dict = {
     "directions": {},
     "current_calibration": {
@@ -467,6 +918,170 @@ STATE: dict = {
     },
     "computed_layers": [],
 }
+
+
+# ━━ Disk persistence helpers ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _safe_model_slug() -> str:
+    return MODEL_NAME.replace("/", "_").replace(":", "_")
+
+
+def persist_direction(layer_key, direction: torch.Tensor, raw_norm: float,
+                      normalized_score: float, top_tokens: list,
+                      bottom_tokens: list, set_id: int,
+                      extraction_method: str = "mean_diff",
+                      extra_meta: dict = None) -> None:
+    """
+    Persist a single direction (metadata JSON + tensor .pt) to RESULTS_DIR.
+
+    Filename patterns:
+      - canonical mean_diff: {slug}_L{NNN}_v{ID}.json|pt
+      - SOM neuron #i:       {slug}_L{NNN}_som_n{ii}_v{ID}.json|pt   (ii zero-padded to 2)
+      - whitened SVD #i:     {slug}_L{NNN}_svd{i}_v{ID}.json|pt      (forward-compat)
+    """
+    try:
+        slug = _safe_model_slug()
+        if isinstance(layer_key, int):
+            layer_int = int(layer_key)
+            stem = f"{slug}_L{layer_int:03d}_v{set_id}"
+        else:
+            s = str(layer_key)
+            if "_som_n" in s:
+                lp, _, ip = s.partition("_som_n")
+                layer_int = int(lp)
+                stem = f"{slug}_L{layer_int:03d}_som_n{int(ip):02d}_v{set_id}"
+            elif "_svd" in s:
+                lp, _, ip = s.partition("_svd")
+                layer_int = int(lp)
+                stem = f"{slug}_L{layer_int:03d}_svd{int(ip)}_v{set_id}"
+            else:
+                layer_int = int(s)
+                stem = f"{slug}_L{layer_int:03d}_v{set_id}"
+
+        meta_path = RESULTS_DIR / f"{stem}.json"
+        tensor_path = meta_path.with_suffix(".pt")
+        payload = {
+            "model": MODEL_NAME,
+            "layer": layer_int,
+            "layer_key": str(layer_key),
+            "raw_norm": raw_norm,
+            "normalized_score": normalized_score,
+            "top_tokens": top_tokens,
+            "bottom_tokens": bottom_tokens,
+            "calibration_set_id": set_id,
+            "n_layers": N_LAYERS,
+            "d_model": D_MODEL,
+            "extraction_method": extraction_method,
+        }
+        if extra_meta:
+            payload.update(extra_meta)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        torch.save(direction.detach().cpu(), tensor_path)
+    except Exception as e:
+        print(f"[PERSIST] Warning: could not save {layer_key}: {e}")
+
+
+def load_persisted_directions() -> int:
+    """
+    Load all saved directions matching MODEL_NAME / N_LAYERS / D_MODEL.
+    For each layer-key (int canonical, "{layer}_som_n{i}", "{layer}_svd{i}"),
+    the most recent calibration_set_id wins.
+    """
+    import re
+    slug = _safe_model_slug()
+    candidates = sorted(RESULTS_DIR.glob(f"{slug}_L*.json"))
+    if not candidates:
+        return 0
+
+    som_re = re.compile(r".*_L(\d{3})_som_n(\d+)_v(\d+)\.json$")
+    svd_re = re.compile(r".*_L(\d{3})_svd(\d+)_v(\d+)\.json$")
+
+    best_per_key: dict = {}
+    for meta_path in candidates:
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("model") != MODEL_NAME:
+                continue
+            if meta.get("n_layers") != N_LAYERS or meta.get("d_model") != D_MODEL:
+                continue
+            layer_int = int(meta["layer"])
+            set_id = int(meta.get("calibration_set_id", 0))
+            name = meta_path.name
+            if som_re.match(name) is not None:
+                idx = int(som_re.match(name).group(2))
+                key = f"{layer_int}_som_n{idx}"
+            elif svd_re.match(name) is not None:
+                idx = int(svd_re.match(name).group(2))
+                key = f"{layer_int}_svd{idx}"
+            else:
+                key = layer_int
+            cur = best_per_key.get(key)
+            if cur is None or set_id > cur[0]:
+                best_per_key[key] = (set_id, meta_path)
+        except Exception as e:
+            print(f"[PERSIST] Skipping {meta_path.name}: {e}")
+            continue
+
+    loaded = 0
+    max_set_id = 0
+    for key, (set_id, meta_path) in sorted(
+        best_per_key.items(), key=lambda kv: _computed_layer_sort_key(kv[0])
+    ):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            tensor_path = meta_path.with_suffix(".pt")
+            if not tensor_path.exists():
+                print(f"[PERSIST] Missing tensor for {key}: {tensor_path.name}")
+                continue
+            direction = torch.load(tensor_path, map_location="cpu")
+            if direction.shape[-1] != D_MODEL:
+                print(f"[PERSIST] Shape mismatch {key}: {tuple(direction.shape)}")
+                continue
+            method = meta.get("extraction_method", "mean_diff")
+            entry = {
+                "direction": direction.detach().to("cpu"),
+                "raw_norm": float(meta["raw_norm"]),
+                "normalized_score": float(meta["normalized_score"]),
+                "top_tokens": meta.get("top_tokens", []),
+                "bottom_tokens": meta.get("bottom_tokens", []),
+                "calibration_set_id": set_id,
+                "model_name": MODEL_NAME,
+                "n_layers": N_LAYERS,
+                "d_model": D_MODEL,
+                "extraction_method": method,
+            }
+            # Carry through SOM-specific metadata if present.
+            for k_meta in ("lattice_position", "neuron_index", "cluster_size",
+                           "cluster_share", "cluster_tightness",
+                           "som_grid_rows", "som_grid_cols"):
+                if k_meta in meta:
+                    entry[k_meta] = meta[k_meta]
+            entry["display_label"] = _layer_label(key) if False else None  # set below
+            STATE["directions"][key] = entry
+            entry["display_label"] = _layer_label(key)
+            if key not in STATE["computed_layers"]:
+                STATE["computed_layers"].append(key)
+            loaded += 1
+            max_set_id = max(max_set_id, set_id)
+        except Exception as e:
+            print(f"[PERSIST] Failed to load {key}: {e}")
+            continue
+
+    STATE["computed_layers"].sort(key=_computed_layer_sort_key)
+    if max_set_id > STATE["current_calibration"]["id"]:
+        STATE["current_calibration"]["id"] = max_set_id
+    return loaded
+
+
+_n_loaded = load_persisted_directions()
+if _n_loaded:
+    print(f"[PERSIST] Loaded {_n_loaded} cached direction(s) from {RESULTS_DIR}")
+    print(f"[PERSIST] Layers: {STATE['computed_layers']}")
+else:
+    print(f"[PERSIST] No cached directions found in {RESULTS_DIR}")
 
 print(f"Direction Explorer ready ({MODEL_NAME}, manual PyTorch hooks)")
 
@@ -489,19 +1104,30 @@ class CalibrationRequest(BaseModel):
     harmful_prompts: list[str]
     harmless_prompts: list[str]
     layer: int
+    extraction_method: str = "mean_diff"   # "mean_diff" | "som_md"
+    n_directions: int = 1                  # reserved for whitened_svd; ignored for mean_diff/som_md
+    # SOM-specific parameters (used only when extraction_method == "som_md")
+    som_grid_rows: int = 4
+    som_grid_cols: int = 4
+    som_iterations: int = 10000
+    som_learning_rate: float = 0.01
+    som_sigma: float = 0.3
+    som_seed: int = 42
+    replace_canonical: bool = False        # if True, top SOM neuron replaces int-keyed canonical
 
 
 class AblationRequest(BaseModel):
     prompt: str
     direction_layer: int
+    extra_direction_layers: list[str] = []  # accepts ints or "{layer}_som_n{i}" / "{layer}_svd{i}"
     mode: str  # "off" | "partial" | "full"
     strength: float = 0.5
-    max_new_tokens: int = 1000
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
     temperature: float = 0.7
 
 
 class ComparisonRequest(BaseModel):
-    layers: list[int]
+    layers: list[str]   # accepts ints or "{layer}_som_n{i}" / "{layer}_svd{i}"
 
 
 # ── /state ───────────────────────────────────────────────────────────────
@@ -509,13 +1135,48 @@ class ComparisonRequest(BaseModel):
 @app.get("/state")
 def get_state():
     dirs = []
-    for lid, info in sorted(STATE["directions"].items()):
+    valid_layer_keys = []
+    items = sorted(
+        STATE["directions"].items(),
+        key=lambda kv: _computed_layer_sort_key(kv[0]),
+    )
+    for lid, info in items:
+        saved_model = info.get("model_name")
+        if saved_model is not None and saved_model != MODEL_NAME:
+            print(
+                f"[CALIB] Skipping cached direction {lid}: "
+                f"model mismatch ({saved_model} != {MODEL_NAME})"
+            )
+            continue
+        method = info.get("extraction_method", "mean_diff")
+        if isinstance(lid, int):
+            layer_int = lid
+        else:
+            try:
+                base = str(lid).split("_som_n")[0].split("_svd")[0]
+                layer_int = int(base)
+            except Exception:
+                layer_int = -1
         dirs.append({
-            "layer": lid,
+            "layer": layer_int,
+            "layer_key": str(lid),
+            "label": _layer_label(lid),
+            "kind": _direction_kind(lid),
+            "extraction_method": method,
             "raw_norm": info["raw_norm"],
             "normalized_score": info["normalized_score"],
             "calibration_set_id": info["calibration_set_id"],
+            "top_tokens": info.get("top_tokens", []),
+            "bottom_tokens": info.get("bottom_tokens", []),
+            "lattice_position": info.get("lattice_position"),
+            "neuron_index": info.get("neuron_index"),
+            "cluster_size": info.get("cluster_size"),
+            "cluster_share": info.get("cluster_share"),
+            "cluster_tightness": info.get("cluster_tightness"),
+            "som_grid_rows": info.get("som_grid_rows"),
+            "som_grid_cols": info.get("som_grid_cols"),
         })
+        valid_layer_keys.append(str(lid))
     return {
         "n_layers": N_LAYERS,
         "d_model": D_MODEL,
@@ -524,7 +1185,7 @@ def get_state():
         "device": DEVICE,
         "tokenizer_vocab": int(model.lm_head.weight.shape[0]),
         "directions": dirs,
-        "computed_layers": sorted(STATE["directions"].keys()),
+        "computed_layers": valid_layer_keys,
         "calibration_set_id": STATE["current_calibration"]["id"],
     }
 
@@ -547,6 +1208,12 @@ def calibration_compute(req: CalibrationRequest):
         raise HTTPException(
             status_code=400, detail=f"layer must be in [0, {N_LAYERS - 1}]"
         )
+    method = req.extraction_method
+    if method not in ("mean_diff", "som_md"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown extraction_method '{method}' (allowed: mean_diff, som_md)",
+        )
 
     cur = STATE["current_calibration"]
     if (req.harmful_prompts != cur["harmful"]) or (req.harmless_prompts != cur["harmless"]):
@@ -558,39 +1225,196 @@ def calibration_compute(req: CalibrationRequest):
     set_id = STATE["current_calibration"]["id"]
 
     t0 = time.time()
-    mean_h = compute_single_layer_mean(req.harmful_prompts, req.layer)
-    mean_n = compute_single_layer_mean(req.harmless_prompts, req.layer)
-    mean_diff = mean_h - mean_n
-    raw_norm = float(mean_diff.norm().item())
-    direction = mean_diff / (mean_diff.norm() + 1e-9)
 
-    baseline = (mean_h.norm().item() + mean_n.norm().item()) / 2
-    normalized_score = raw_norm / (baseline + 1e-9)
+    # ── mean_diff path ─────────────────────────────────────────────────────
+    if method == "mean_diff":
+        mean_h = compute_single_layer_mean(req.harmful_prompts, req.layer)
+        mean_n = compute_single_layer_mean(req.harmless_prompts, req.layer)
+        mean_diff = mean_h - mean_n
+        raw_norm = float(mean_diff.norm().item())
+        direction = mean_diff / (mean_diff.norm() + 1e-9)
+        baseline = (mean_h.norm().item() + mean_n.norm().item()) / 2
+        normalized_score = raw_norm / (baseline + 1e-9)
+        top_tokens, bottom_tokens = logit_lens(direction, k=10)
 
-    top_tokens, bottom_tokens = logit_lens(direction, k=10)
+        STATE["directions"][req.layer] = {
+            "direction": direction.detach().to("cpu"),
+            "raw_norm": raw_norm,
+            "normalized_score": normalized_score,
+            "top_tokens": top_tokens,
+            "bottom_tokens": bottom_tokens,
+            "calibration_set_id": set_id,
+            "model_name": MODEL_NAME,
+            "n_layers": N_LAYERS,
+            "d_model": D_MODEL,
+            "extraction_method": "mean_diff",
+            "display_label": f"L{req.layer}",
+        }
+        if req.layer not in STATE["computed_layers"]:
+            STATE["computed_layers"].append(req.layer)
+            STATE["computed_layers"].sort(key=_computed_layer_sort_key)
 
-    STATE["directions"][req.layer] = {
-        "direction": direction.detach().to("cpu"),
-        "raw_norm": raw_norm,
-        "normalized_score": normalized_score,
-        "top_tokens": top_tokens,
-        "bottom_tokens": bottom_tokens,
-        "calibration_set_id": set_id,
-    }
-    if req.layer not in STATE["computed_layers"]:
-        STATE["computed_layers"].append(req.layer)
-        STATE["computed_layers"].sort()
+        persist_direction(
+            layer_key=req.layer,
+            direction=direction,
+            raw_norm=raw_norm,
+            normalized_score=normalized_score,
+            top_tokens=top_tokens,
+            bottom_tokens=bottom_tokens,
+            set_id=set_id,
+            extraction_method="mean_diff",
+        )
+
+        return {
+            "method": "mean_diff",
+            "layer": req.layer,
+            "raw_norm": round(raw_norm, 4),
+            "normalized_score": round(normalized_score, 4),
+            "direction_shape": list(direction.shape),
+            "direction_dtype": str(direction.dtype),
+            "top_tokens": [{"token": t["token"], "score": round(t["score"], 4)}
+                           for t in top_tokens],
+            "bottom_tokens": [{"token": t["token"], "score": round(t["score"], 4)}
+                              for t in bottom_tokens],
+            "calibration_set_id": set_id,
+            "elapsed_s": round(time.time() - t0, 2),
+        }
+
+    # ── som_md path (Piras et al. 2026) ────────────────────────────────────
+    rows = max(2, min(int(req.som_grid_rows), 8))
+    cols = max(2, min(int(req.som_grid_cols), 8))
+    n_iter = max(1000, min(int(req.som_iterations), 50000))
+    H_acts = collect_layer_activations(req.harmful_prompts, req.layer)
+    N_acts = collect_layer_activations(req.harmless_prompts, req.layer)
+
+    som_results = compute_som_directions(
+        H_acts, N_acts,
+        grid_size=(rows, cols),
+        n_iterations=n_iter,
+        learning_rate=float(req.som_learning_rate),
+        sigma=float(req.som_sigma),
+        seed=int(req.som_seed),
+    )
+
+    mu_harmless_norm = float(N_acts.mean(dim=0).norm().item())
+    mu_harmful_norm = float(H_acts.mean(dim=0).norm().item())
+
+    response_neurons = []
+    canonical_replaced = False
+    for rank, r in enumerate(som_results):
+        i = int(r["neuron_index"])
+        layer_key = f"{req.layer}_som_n{i}"
+        d_vec = r["direction"]
+        raw_norm_i = float(r["raw_norm"])
+        cluster_share = float(r["cluster_share"])
+        # Use cluster_share as the "normalized_score" proxy for SOM neurons.
+        normalized_score_i = cluster_share
+        top_tokens_i, bottom_tokens_i = logit_lens(d_vec, k=10)
+
+        entry = {
+            "direction": d_vec.detach().to("cpu"),
+            "raw_norm": raw_norm_i,
+            "normalized_score": normalized_score_i,
+            "top_tokens": top_tokens_i,
+            "bottom_tokens": bottom_tokens_i,
+            "calibration_set_id": set_id,
+            "model_name": MODEL_NAME,
+            "n_layers": N_LAYERS,
+            "d_model": D_MODEL,
+            "extraction_method": "som_md",
+            "lattice_position": list(r["lattice_position"]),
+            "neuron_index": i,
+            "cluster_size": int(r["cluster_size"]),
+            "cluster_share": cluster_share,
+            "cluster_tightness": float(r["cluster_tightness"]) if r["cluster_tightness"] == r["cluster_tightness"] else None,
+            "som_grid_rows": rows,
+            "som_grid_cols": cols,
+            "display_label": f"L{req.layer} (SOM n[{i // cols},{i % cols}])",
+        }
+
+        STATE["directions"][layer_key] = entry
+        if layer_key not in STATE["computed_layers"]:
+            STATE["computed_layers"].append(layer_key)
+
+        persist_direction(
+            layer_key=layer_key,
+            direction=d_vec,
+            raw_norm=raw_norm_i,
+            normalized_score=normalized_score_i,
+            top_tokens=top_tokens_i,
+            bottom_tokens=bottom_tokens_i,
+            set_id=set_id,
+            extraction_method="som_md",
+            extra_meta={
+                "lattice_position": list(r["lattice_position"]),
+                "neuron_index": i,
+                "cluster_size": int(r["cluster_size"]),
+                "cluster_share": cluster_share,
+                "cluster_tightness": entry["cluster_tightness"],
+                "som_grid_rows": rows,
+                "som_grid_cols": cols,
+            },
+        )
+
+        # If user asked replace_canonical and this is the top-cluster neuron,
+        # also write a canonical entry at int key.
+        if req.replace_canonical and rank == 0:
+            canonical_replaced = True
+            STATE["directions"][req.layer] = {
+                "direction": d_vec.detach().to("cpu"),
+                "raw_norm": raw_norm_i,
+                "normalized_score": normalized_score_i,
+                "top_tokens": top_tokens_i,
+                "bottom_tokens": bottom_tokens_i,
+                "calibration_set_id": set_id,
+                "model_name": MODEL_NAME,
+                "n_layers": N_LAYERS,
+                "d_model": D_MODEL,
+                "extraction_method": "som_md",
+                "display_label": f"L{req.layer} (SOM canonical)",
+            }
+            if req.layer not in STATE["computed_layers"]:
+                STATE["computed_layers"].append(req.layer)
+            persist_direction(
+                layer_key=req.layer,
+                direction=d_vec,
+                raw_norm=raw_norm_i,
+                normalized_score=normalized_score_i,
+                top_tokens=top_tokens_i,
+                bottom_tokens=bottom_tokens_i,
+                set_id=set_id,
+                extraction_method="som_md",
+            )
+
+        response_neurons.append({
+            "neuron_index": i,
+            "lattice_position": list(r["lattice_position"]),
+            "layer_key": layer_key,
+            "is_canonical": (req.replace_canonical and rank == 0),
+            "rank_by_cluster_size": rank,
+            "raw_norm": round(raw_norm_i, 4),
+            "cluster_size": int(r["cluster_size"]),
+            "cluster_share": round(cluster_share, 4),
+            "cluster_tightness": (round(float(r["cluster_tightness"]), 4)
+                                  if r["cluster_tightness"] == r["cluster_tightness"] else None),
+            "top_tokens": [{"token": t["token"], "score": round(t["score"], 4)}
+                           for t in top_tokens_i],
+            "bottom_tokens": [{"token": t["token"], "score": round(t["score"], 4)}
+                              for t in bottom_tokens_i],
+        })
+
+    STATE["computed_layers"].sort(key=_computed_layer_sort_key)
 
     return {
+        "method": "som_md",
         "layer": req.layer,
-        "raw_norm": round(raw_norm, 4),
-        "normalized_score": round(normalized_score, 4),
-        "direction_shape": list(direction.shape),
-        "direction_dtype": str(direction.dtype),
-        "top_tokens": [{"token": t["token"], "score": round(t["score"], 4)}
-                       for t in top_tokens],
-        "bottom_tokens": [{"token": t["token"], "score": round(t["score"], 4)}
-                          for t in bottom_tokens],
+        "n_neurons": rows * cols,
+        "som_grid_rows": rows,
+        "som_grid_cols": cols,
+        "harmful_centroid_norm": round(mu_harmful_norm, 4),
+        "harmless_centroid_norm": round(mu_harmless_norm, 4),
+        "canonical_replaced": canonical_replaced,
+        "neurons": response_neurons,
         "calibration_set_id": set_id,
         "elapsed_s": round(time.time() - t0, 2),
     }
@@ -598,35 +1422,69 @@ def calibration_compute(req: CalibrationRequest):
 
 # ── /ablation/generate ───────────────────────────────────────────────────
 
+def _resolve_ablation_layers(req: AblationRequest) -> list:
+    """
+    Returns deduplicated, ordered list of layer-keys to co-ablate. Primary
+    (always int — canonical at that layer) first, then extras (parsed via
+    `_parse_layer_key` so SOM/SVD string keys are preserved).
+    """
+    seen = set()
+    ordered: list = []
+    primary = int(req.direction_layer)
+    for raw in [primary, *req.extra_direction_layers]:
+        k = _parse_layer_key(raw)
+        if k in seen:
+            continue
+        seen.add(k)
+        ordered.append(k)
+    missing = [l for l in ordered if l not in STATE["directions"]]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No cached direction(s) for layer-key(s) {missing}. "
+                   "Compute them on the Calibration tab first.",
+        )
+    return ordered
+
+
 @app.post("/ablation/generate")
 def ablation_generate(req: AblationRequest):
     if req.mode not in ("off", "partial", "full"):
         raise HTTPException(status_code=400, detail=f"unknown mode {req.mode}")
-    if req.direction_layer not in STATE["directions"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No cached direction at layer {req.direction_layer}. "
-                   "Compute it on the Calibration tab first.",
-        )
 
-    direction = STATE["directions"][req.direction_layer]["direction"].to(DEVICE)
+    ablation_layers = _resolve_ablation_layers(req)
+    primary_direction = STATE["directions"][int(req.direction_layer)]["direction"].to(DEVICE)
+    all_directions = [STATE["directions"][lid]["direction"].to(DEVICE) for lid in ablation_layers]
+
     formatted = format_chat_text(tokenizer, req.prompt)
+
+    eff_max_new = min(max(int(req.max_new_tokens), 1), MAX_NEW_TOKENS_CAP)
+
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    gen_t0 = time.time()
+    prompt_token_len = tokenizer(formatted, return_tensors="pt")["input_ids"].shape[1]
 
     # Defensive: always start from clean weights
     restore_weights()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
 
     # Baseline run (no ablation)
     t0 = time.time()
     base_text, base_ids, prompt_len = hf_generate(
-        formatted, req.max_new_tokens, req.temperature,
+        formatted, eff_max_new, req.temperature,
     )
     base_response = extract_response_text(
         tokenizer.decode(base_ids, skip_special_tokens=False), formatted,
     ) or base_text
     base_tokens, base_projs = capture_token_projections(
-        base_ids, prompt_len, req.direction_layer, direction, ablation_layer_hook=None,
+        base_ids, prompt_len, int(req.direction_layer), primary_direction, ablation_layer_hook=None,
     )
     elapsed_baseline = round(time.time() - t0, 2)
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
 
     # Ablated run
     t1 = time.time()
@@ -639,27 +1497,27 @@ def ablation_generate(req: AblationRequest):
     try:
         if req.mode == "off":
             abl_text, abl_ids, abl_prompt_len = hf_generate(
-                formatted, req.max_new_tokens, req.temperature,
+                formatted, eff_max_new, req.temperature,
             )
             abl_tokens, abl_projs = capture_token_projections(
-                abl_ids, abl_prompt_len, req.direction_layer, direction,
+                abl_ids, abl_prompt_len, int(req.direction_layer), primary_direction,
                 ablation_layer_hook=None,
             )
 
         elif req.mode == "partial":
             alpha = float(max(0.0, min(1.0, req.strength)))
-            hook_fn = make_partial_ablation_hook(direction, alpha)
+            hook_fn = make_partial_ablation_hook(all_directions, alpha)
             handles = [layer.register_forward_hook(hook_fn)
                        for layer in model.model.layers]
             try:
                 abl_text, abl_ids, abl_prompt_len = hf_generate(
-                    formatted, req.max_new_tokens, req.temperature,
+                    formatted, eff_max_new, req.temperature,
                 )
             finally:
                 for h in handles:
                     h.remove()
             abl_tokens, abl_projs = capture_token_projections(
-                abl_ids, abl_prompt_len, req.direction_layer, direction,
+                abl_ids, abl_prompt_len, int(req.direction_layer), primary_direction,
                 ablation_layer_hook=hook_fn,
             )
 
@@ -667,27 +1525,53 @@ def ablation_generate(req: AblationRequest):
             # CRITICAL: capture must run before restore_weights().
             weights_orthogonalized = False
             try:
-                apply_full_ablation(direction)
+                apply_full_ablation(all_directions)
                 weights_orthogonalized = True
+                if DEVICE == "cuda":
+                    torch.cuda.empty_cache()
                 abl_text, abl_ids, abl_prompt_len = hf_generate(
-                    formatted, req.max_new_tokens, req.temperature,
+                    formatted, eff_max_new, req.temperature,
                 )
                 abl_tokens, abl_projs = capture_token_projections(
-                    abl_ids, abl_prompt_len, req.direction_layer, direction,
+                    abl_ids, abl_prompt_len, int(req.direction_layer), primary_direction,
                     ablation_layer_hook=None,
                 )
             finally:
                 if weights_orthogonalized:
                     restore_weights()
+                    if DEVICE == "cuda":
+                        torch.cuda.empty_cache()
 
+    except HTTPException:
+        restore_weights()
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        raise
     except Exception as e:
         restore_weights()
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
         raise HTTPException(status_code=500, detail=f"ablation generation failed: {e}")
 
     abl_response = extract_response_text(
         tokenizer.decode(abl_ids, skip_special_tokens=False), formatted,
     ) or abl_text
     elapsed_ablated = round(time.time() - t1, 2)
+
+    total_elapsed = round(time.time() - gen_t0, 2)
+    vram_peak_str = ""
+    if DEVICE == "cuda":
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        vram_peak_str = f", VRAM peak={peak_gb:.2f}GB"
+    layers_repr = ",".join(_layer_label(l) for l in ablation_layers)
+    print(
+        f"[GEN] mode={req.mode} primary=L{int(req.direction_layer)} "
+        f"co-ablated=[{layers_repr}] (k={len(ablation_layers)}) "
+        f"prompt_len={prompt_token_len} "
+        f"max_new={eff_max_new} (req={req.max_new_tokens}) "
+        f"elapsed={total_elapsed}s (base={elapsed_baseline}s, abl={elapsed_ablated}s)"
+        f"{vram_peak_str}"
+    )
 
     return {
         "baseline_response": base_response,
@@ -699,7 +1583,9 @@ def ablation_generate(req: AblationRequest):
         "elapsed_baseline_s": elapsed_baseline,
         "elapsed_ablated_s": elapsed_ablated,
         "mode": req.mode,
-        "direction_layer": req.direction_layer,
+        "direction_layer": int(req.direction_layer),
+        "direction_layers": [str(l) for l in ablation_layers],
+        "direction_labels": [_layer_label(l) for l in ablation_layers],
         "strength": req.strength,
     }
 
@@ -708,12 +1594,21 @@ def ablation_generate(req: AblationRequest):
 
 @app.post("/comparison/analyze")
 def comparison_analyze(req: ComparisonRequest):
-    layers = sorted(set(int(l) for l in req.layers))
+    parsed = []
+    seen = set()
+    for raw in req.layers:
+        k = _parse_layer_key(raw)
+        if k in seen:
+            continue
+        seen.add(k)
+        parsed.append(k)
+    layers = sorted(parsed, key=_computed_layer_sort_key)
+
     missing = [l for l in layers if l not in STATE["directions"]]
     if missing:
         raise HTTPException(
             status_code=400,
-            detail=f"Directions not computed for layers {missing}. Compute them first.",
+            detail=f"Directions not computed for layer-key(s) {missing}. Compute them first.",
         )
     if len(layers) < 2:
         raise HTTPException(status_code=400, detail="Pick at least 2 layers.")
@@ -725,9 +1620,11 @@ def comparison_analyze(req: ComparisonRequest):
     cos = (normed @ normed.t()).cpu().tolist()
     cos_rounded = [[round(float(v), 4) for v in row] for row in cos]
 
+    labels = [_layer_label(l) for l in layers]
     norm_data = [
         {
-            "layer": l,
+            "layer_key": str(l),
+            "label": _layer_label(l),
             "raw_norm": round(STATE["directions"][l]["raw_norm"], 4),
             "normalized_score": round(STATE["directions"][l]["normalized_score"], 4),
         }
@@ -742,14 +1639,17 @@ def comparison_analyze(req: ComparisonRequest):
             top_b = {t["token"] for t in STATE["directions"][lb]["top_tokens"]}
             shared = sorted(top_a & top_b)
             overlap.append({
-                "layer_a": la,
-                "layer_b": lb,
+                "layer_a": str(la),
+                "layer_b": str(lb),
+                "label_a": _layer_label(la),
+                "label_b": _layer_label(lb),
                 "shared_tokens": shared,
                 "count": len(shared),
             })
 
     return {
-        "layers": layers,
+        "layers": [str(l) for l in layers],
+        "labels": labels,
         "cosine_matrix": cos_rounded,
         "norms": norm_data,
         "top_token_overlap": overlap,
@@ -1157,7 +2057,7 @@ async function runAblation() {
       direction_layer: parseInt(sel.value),
       mode: mode,
       strength: parseFloat(document.getElementById("abl-strength").value),
-      max_new_tokens: 99999,
+      max_new_tokens: 1500,
       temperature: 0.7,
     };
     const r = await fetch("/ablation/generate", {
