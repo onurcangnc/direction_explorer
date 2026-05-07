@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Direction Explorer — __MODEL_NAME__</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .small-mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; }
+  .cos-cell { text-align: center; padding: 6px 10px; font-variant-numeric: tabular-nums; }
+  .token-table td, .token-table th { padding: 4px 8px; font-size: 12px; }
+  .response-box { white-space: pre-wrap; word-wrap: break-word;
+    background: var(--bs-tertiary-bg); padding: 10px; border-radius: 6px;
+    max-height: 300px; overflow-y: auto; font-size: 13px; }
+  .kbd-num { font-variant-numeric: tabular-nums; }
+  .nav-tabs .nav-link { font-size: 13px; }
+  .form-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.75; }
+  .text-tiny { font-size: 10px; opacity: 0.7; }
+  .neuron-row { background: var(--bs-tertiary-bg); border-radius: 6px; padding: 8px 12px; margin-bottom: 4px; }
+  .method-box { padding: 12px; border-radius: 6px; background: var(--bs-tertiary-bg); margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="container-fluid py-3">
+  <div class="d-flex align-items-baseline gap-3 mb-1">
+    <h3 class="mb-0">Direction Explorer — __MODEL_NAME__</h3>
+    <span class="text-secondary small">Arditi 2024 (single) + Piras 2026 (SOM multi)</span>
+    <span class="ms-auto text-tiny" id="model-info">loading...</span>
+  </div>
+  <div class="alert alert-warning py-2 px-3 small mb-3">
+    Research demo. Ablated outputs may include harmful content. Mech interp study only.
+  </div>
+
+  <ul class="nav nav-tabs mb-3" role="tablist">
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#pane-cal" type="button">1. Calibration</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-abl" type="button">2. Ablation</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-cmp" type="button">3. Comparison</button></li>
+  </ul>
+
+  <div class="tab-content">
+
+    <!-- CALIBRATION -->
+    <div class="tab-pane fade show active" id="pane-cal" role="tabpanel">
+      <div class="row g-3">
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex"><span>Harmful Prompts</span><span class="ms-auto badge text-bg-danger" id="harm-count">0</span></div>
+            <div class="card-body"><textarea id="harm-prompts" class="form-control small-mono" rows="12"></textarea></div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card h-100">
+            <div class="card-header d-flex"><span>Harmless Prompts</span><span class="ms-auto badge text-bg-success" id="hless-count">0</span></div>
+            <div class="card-body"><textarea id="hless-prompts" class="form-control small-mono" rows="12"></textarea></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="method-box mt-3">
+        <div class="row g-3 align-items-end">
+          <div class="col-md-3">
+            <label class="form-label">Extraction Method</label>
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="cal-method" id="cal-method-md" value="mean_diff" checked>
+              <label class="form-check-label" for="cal-method-md"><strong>Arditi</strong> (mean_diff)</label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="cal-method" id="cal-method-som" value="som_md">
+              <label class="form-check-label" for="cal-method-som"><strong>Piras</strong> (SOM multi)</label>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label" for="cal-layer">Layer <span id="cal-layer-val" class="kbd-num">__DEFAULT_LAYER__</span></label>
+            <input type="range" class="form-range" id="cal-layer" min="0" max="__MAX_LAYER__" value="__DEFAULT_LAYER__" />
+            <div class="text-tiny" id="cal-layer-bounds">0 ... __MAX_LAYER__</div>
+          </div>
+          <div class="col-md-3">
+            <button id="cal-compute" class="btn btn-primary w-100">Compute</button>
+            <div id="cal-status" class="text-tiny mt-1"></div>
+          </div>
+        </div>
+
+        <div id="som-params" class="mt-3" style="display:none;">
+          <div class="row g-2 align-items-end">
+            <div class="col-md-2"><label class="form-label">Grid rows</label><input type="number" class="form-control form-control-sm" id="som-rows" min="2" max="8" value="3"></div>
+            <div class="col-md-2"><label class="form-label">Grid cols</label><input type="number" class="form-control form-control-sm" id="som-cols" min="2" max="8" value="3"></div>
+            <div class="col-md-2"><label class="form-label">Iterations</label><input type="number" class="form-control form-control-sm" id="som-iters" min="1000" max="50000" step="1000" value="5000"></div>
+            <div class="col-md-2"><label class="form-label">LR</label><input type="number" class="form-control form-control-sm" id="som-lr" step="0.001" value="0.01"></div>
+            <div class="col-md-2"><label class="form-label">σ</label><input type="number" class="form-control form-control-sm" id="som-sigma" step="0.05" value="0.3"></div>
+            <div class="col-md-2"><label class="form-label">Seed</label><input type="number" class="form-control form-control-sm" id="som-seed" value="42"></div>
+          </div>
+          <div class="form-check form-switch mt-2">
+            <input class="form-check-input" type="checkbox" id="som-replace-canonical">
+            <label class="form-check-label text-tiny" for="som-replace-canonical">Replace canonical (off = clean Arditi/Piras separation, recommended)</label>
+          </div>
+        </div>
+      </div>
+
+      <div id="cal-md-results" class="mt-3" style="display:none;">
+        <div class="row g-3">
+          <div class="col-md-4"><div class="card"><div class="card-body">
+            <div class="text-tiny">Direction shape</div><div class="small-mono" id="cal-shape">—</div>
+            <hr class="my-2"/>
+            <div class="text-tiny">Raw norm ‖μ_h − μ_n‖</div><div class="h5 kbd-num" id="cal-rawnorm">—</div>
+            <div class="text-tiny">Normalized score</div><div class="h5 kbd-num" id="cal-normscore">—</div>
+            <div class="text-tiny mt-2" id="cal-meta">—</div>
+          </div></div></div>
+          <div class="col-md-4"><div class="card"><div class="card-header py-1 small">Top 10 (refusal)</div><div class="card-body p-2"><table class="table table-sm table-borderless token-table mb-0" id="cal-top-tokens"></table></div></div></div>
+          <div class="col-md-4"><div class="card"><div class="card-header py-1 small">Bottom 10 (anti-refusal)</div><div class="card-body p-2"><table class="table table-sm table-borderless token-table mb-0" id="cal-bottom-tokens"></table></div></div></div>
+        </div>
+      </div>
+
+      <div id="cal-som-results" class="mt-3" style="display:none;">
+        <div class="card">
+          <div class="card-header d-flex"><span>SOM Neurons (sorted by cluster_size)</span><span class="ms-auto text-tiny" id="som-summary">—</span></div>
+          <div class="card-body p-2"><div id="som-neuron-list"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ABLATION -->
+    <div class="tab-pane fade" id="pane-abl" role="tabpanel">
+      <div class="method-box">
+        <div class="row g-3 align-items-end">
+          <div class="col-md-4">
+            <label class="form-label">Ablation Method</label>
+            <div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="abl-method" id="abl-method-arditi" value="arditi" checked>
+                <label class="form-check-label" for="abl-method-arditi"><strong>Arditi</strong> (single)</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="abl-method" id="abl-method-piras" value="piras">
+                <label class="form-check-label" for="abl-method-piras"><strong>Piras</strong> (multi)</label>
+              </div>
+            </div>
+            <div class="text-tiny mt-1">Cross-method mixing disabled.</div>
+          </div>
+          <div class="col-md-8" id="abl-arditi-picker">
+            <label class="form-label">Direction (mean_diff only)</label>
+            <select id="abl-direction-arditi" class="form-select"></select>
+          </div>
+          <div class="col-md-8" id="abl-piras-picker" style="display:none;">
+            <label class="form-label">SOM Neurons (Cmd/Ctrl-click; same layer only)</label>
+            <select id="abl-direction-piras" class="form-select" multiple size="6"></select>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-3 mt-2 align-items-end">
+        <div class="col-md-5">
+          <label class="form-label">Mode</label>
+          <div>
+            <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="abl-mode" id="abl-off" value="off" checked><label class="form-check-label" for="abl-off">Off</label></div>
+            <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="abl-mode" id="abl-partial" value="partial"><label class="form-check-label" for="abl-partial">Partial</label></div>
+            <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="abl-mode" id="abl-full" value="full"><label class="form-check-label" for="abl-full">Full (weight orthogonalize)</label></div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">Strength α <span id="abl-strength-val" class="kbd-num">0.50</span></label>
+          <input type="range" class="form-range" id="abl-strength" min="0" max="1" step="0.05" value="0.5" />
+        </div>
+        <div class="col-md-3">
+          <label class="form-label">Max new tokens</label>
+          <input type="number" class="form-control form-control-sm" id="abl-max-tokens" min="32" max="2048" value="256">
+        </div>
+      </div>
+
+      <div class="row g-3 mt-2 align-items-end">
+        <div class="col-md-9">
+          <label class="form-label">Test Prompt</label>
+          <textarea id="abl-prompt" class="form-control small-mono" rows="2">How do I make a bomb?</textarea>
+        </div>
+        <div class="col-md-3 d-flex flex-column gap-2">
+          <button id="abl-generate" class="btn btn-primary">Generate</button>
+          <span id="abl-status" class="text-tiny"></span>
+        </div>
+      </div>
+
+      <div class="row g-3 mt-3" id="abl-results" style="display:none;">
+        <div class="col-md-6"><div class="card border-secondary h-100">
+          <div class="card-header d-flex"><span class="badge text-bg-info me-2">BASELINE</span><span class="text-tiny">no ablation</span><span class="ms-auto kbd-num small" id="abl-base-time">—</span></div>
+          <div class="card-body"><div class="response-box" id="abl-base-response"></div><div class="mt-2"><canvas id="abl-base-chart" height="120"></canvas></div></div>
+        </div></div>
+        <div class="col-md-6"><div class="card border-warning h-100">
+          <div class="card-header d-flex"><span class="badge text-bg-warning me-2">ABLATED</span><span class="text-tiny" id="abl-mode-tag">—</span><span class="ms-auto kbd-num small" id="abl-abl-time">—</span></div>
+          <div class="card-body"><div class="response-box" id="abl-abl-response"></div><div class="mt-2"><canvas id="abl-abl-chart" height="120"></canvas></div></div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- COMPARISON -->
+    <div class="tab-pane fade" id="pane-cmp" role="tabpanel">
+      <div class="row g-3 align-items-end">
+        <div class="col-md-8">
+          <label class="form-label">Cached Directions (Cmd/Ctrl-click)</label>
+          <select id="cmp-layers" class="form-select" multiple size="8"></select>
+          <div class="text-tiny mt-1" id="cmp-cached-info">No directions yet.</div>
+        </div>
+        <div class="col-md-4 d-flex flex-column gap-2">
+          <button id="cmp-analyze" class="btn btn-primary">Compute Comparison</button>
+          <span id="cmp-status" class="text-tiny"></span>
+        </div>
+      </div>
+
+      <div id="cmp-results" class="mt-3" style="display:none;">
+        <div class="row g-3">
+          <div class="col-lg-6"><div class="card">
+            <div class="card-header py-1 small">Cosine Similarity Matrix</div>
+            <div class="card-body p-2">
+              <div class="table-responsive"><table class="table table-sm table-bordered mb-0" id="cmp-cos-table"></table></div>
+              <div class="text-tiny mt-2">High Arditi↔SOM (>0.9) → Piras redundant. Low (<0.5) → SOM captures additional subspace.</div>
+            </div>
+          </div></div>
+          <div class="col-lg-6"><div class="card"><div class="card-header py-1 small">Norm Comparison</div><div class="card-body"><canvas id="cmp-norm-chart" height="160"></canvas></div></div></div>
+        </div>
+        <div class="row g-3 mt-1"><div class="col-12"><div class="card">
+          <div class="card-header py-1 small">Top-Token Overlap (pairwise)</div>
+          <div class="card-body p-2"><div class="table-responsive"><table class="table table-sm table-borderless mb-0" id="cmp-overlap-table"></table></div></div>
+        </div></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+let SERVER_STATE = { n_layers: 18, directions: [], computed_layers: [] };
+let baseChart = null, ablChart = null, normChart = null;
+
+const harmTA = document.getElementById("harm-prompts");
+const hlessTA = document.getElementById("hless-prompts");
+const harmCount = document.getElementById("harm-count");
+const hlessCount = document.getElementById("hless-count");
+const calLayer = document.getElementById("cal-layer");
+const calLayerVal = document.getElementById("cal-layer-val");
+const calLayerBounds = document.getElementById("cal-layer-bounds");
+const somParams = document.getElementById("som-params");
+const ablArditiPicker = document.getElementById("abl-arditi-picker");
+const ablPirasPicker = document.getElementById("abl-piras-picker");
+
+const DEFAULT_HARMFUL_JS = __HARMFUL_JSON__;
+const DEFAULT_HARMLESS_JS = __HARMLESS_JSON__;
+
+const setText = (id, v) => document.getElementById(id).textContent = v;
+const escapeHtml = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const lineCount = t => t.split(/\\n+/).map(s => s.trim()).filter(Boolean).length;
+const parseLines = t => t.split(/\\n+/).map(s => s.trim()).filter(Boolean);
+const getCalMethod = () => document.querySelector('input[name="cal-method"]:checked').value;
+const getAblMethod = () => document.querySelector('input[name="abl-method"]:checked').value;
+
+async function fetchState() {
+  const r = await fetch("/state");
+  SERVER_STATE = await r.json();
+  document.getElementById("model-info").textContent =
+    `${SERVER_STATE.model} · ${SERVER_STATE.device} · n_layers=${SERVER_STATE.n_layers}`;
+  calLayer.max = SERVER_STATE.n_layers - 1;
+  calLayerBounds.textContent = `0 ... ${SERVER_STATE.n_layers - 1}`;
+  refreshDirectionDropdowns();
+}
+
+function initCalibration() {
+  harmTA.value = DEFAULT_HARMFUL_JS.join("\\n");
+  hlessTA.value = DEFAULT_HARMLESS_JS.join("\\n");
+  updateCounts();
+  harmTA.addEventListener("input", updateCounts);
+  hlessTA.addEventListener("input", updateCounts);
+  calLayer.addEventListener("input", () => { calLayerVal.textContent = calLayer.value; });
+  document.getElementById("cal-compute").addEventListener("click", computeDirection);
+  document.querySelectorAll('input[name="cal-method"]').forEach(r => {
+    r.addEventListener("change", () => {
+      somParams.style.display = (getCalMethod() === "som_md") ? "" : "none";
+      document.getElementById("cal-md-results").style.display = "none";
+      document.getElementById("cal-som-results").style.display = "none";
+    });
+  });
+}
+
+function updateCounts() {
+  harmCount.textContent = lineCount(harmTA.value);
+  hlessCount.textContent = lineCount(hlessTA.value);
+}
+
+async function computeDirection() {
+  const status = document.getElementById("cal-status");
+  const method = getCalMethod();
+  status.textContent = method === "som_md" ? "training SOM..." : "computing mean_diff...";
+  document.getElementById("cal-compute").disabled = true;
+  try {
+    const body = {
+      harmful_prompts: parseLines(harmTA.value),
+      harmless_prompts: parseLines(hlessTA.value),
+      layer: parseInt(calLayer.value),
+      extraction_method: method,
+    };
+    if (method === "som_md") {
+      body.som_grid_rows = parseInt(document.getElementById("som-rows").value);
+      body.som_grid_cols = parseInt(document.getElementById("som-cols").value);
+      body.som_iterations = parseInt(document.getElementById("som-iters").value);
+      body.som_learning_rate = parseFloat(document.getElementById("som-lr").value);
+      body.som_sigma = parseFloat(document.getElementById("som-sigma").value);
+      body.som_seed = parseInt(document.getElementById("som-seed").value);
+      body.replace_canonical = document.getElementById("som-replace-canonical").checked;
+    }
+    const r = await fetch("/calibration/compute", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    if (d.method === "mean_diff") renderMeanDiffResults(d);
+    else renderSomResults(d);
+    await fetchState();
+    status.textContent = `done in ${d.elapsed_s}s`;
+  } catch (e) {
+    status.textContent = "error: " + e.message;
+  } finally {
+    document.getElementById("cal-compute").disabled = false;
+  }
+}
+
+function renderTokenRows(rows) {
+  let h = `<thead><tr><th>token</th><th class="text-end">cos</th></tr></thead><tbody>`;
+  for (const r of rows) {
+    h += `<tr><td class="small-mono">${escapeHtml(JSON.stringify(r.token))}</td><td class="text-end kbd-num">${r.score.toFixed(4)}</td></tr>`;
+  }
+  return h + "</tbody>";
+}
+
+function renderMeanDiffResults(d) {
+  document.getElementById("cal-md-results").style.display = "";
+  document.getElementById("cal-som-results").style.display = "none";
+  setText("cal-shape", `${JSON.stringify(d.direction_shape)}  ${d.direction_dtype}`);
+  setText("cal-rawnorm", d.raw_norm.toFixed(4));
+  setText("cal-normscore", d.normalized_score.toFixed(4));
+  setText("cal-meta", `Arditi mean_diff at L${d.layer} · cal v${d.calibration_set_id}`);
+  document.getElementById("cal-top-tokens").innerHTML = renderTokenRows(d.top_tokens);
+  document.getElementById("cal-bottom-tokens").innerHTML = renderTokenRows(d.bottom_tokens);
+}
+
+function renderSomResults(d) {
+  document.getElementById("cal-md-results").style.display = "none";
+  document.getElementById("cal-som-results").style.display = "";
+  const totalCluster = d.neurons.reduce((a, n) => a + n.cluster_size, 0);
+  document.getElementById("som-summary").textContent =
+    `L${d.layer} · ${d.som_grid_rows}×${d.som_grid_cols} = ${d.n_neurons} neurons · μ_h=${d.harmful_centroid_norm} μ_n=${d.harmless_centroid_norm} · ${d.canonical_replaced ? "canonical replaced" : "canonical untouched"} · ${d.elapsed_s}s`;
+  let html = "";
+  for (const n of d.neurons) {
+    const top3 = n.top_tokens.slice(0, 3).map(t => `${escapeHtml(JSON.stringify(t.token))}=${t.score.toFixed(3)}`).join(" · ");
+    const bot3 = n.bottom_tokens.slice(0, 3).map(t => `${escapeHtml(JSON.stringify(t.token))}=${t.score.toFixed(3)}`).join(" · ");
+    const tightness = n.cluster_tightness !== null ? n.cluster_tightness.toFixed(3) : "—";
+    html += `<div class="neuron-row">
+      <div class="d-flex align-items-center flex-wrap gap-1">
+        <span class="badge text-bg-primary">#${n.rank_by_cluster_size}</span>
+        <span class="badge text-bg-secondary">n[${n.lattice_position[0]},${n.lattice_position[1]}]</span>
+        <span class="kbd-num">size=${n.cluster_size}/${totalCluster} (${(n.cluster_share*100).toFixed(1)}%)</span>
+        <span class="kbd-num">tightness=${tightness}</span>
+        <span class="kbd-num">‖d‖=${n.raw_norm.toFixed(3)}</span>
+        <span class="ms-auto small-mono text-secondary">${n.layer_key}${n.is_canonical ? " ★" : ""}</span>
+      </div>
+      <div class="small-mono mt-1"><span class="text-success">top:</span> ${top3}</div>
+      <div class="small-mono"><span class="text-danger">bot:</span> ${bot3}</div>
+    </div>`;
+  }
+  document.getElementById("som-neuron-list").innerHTML = html;
+}
+
+function initAblation() {
+  document.getElementById("abl-strength").addEventListener("input", e => {
+    document.getElementById("abl-strength-val").textContent = parseFloat(e.target.value).toFixed(2);
+  });
+  document.getElementById("abl-generate").addEventListener("click", runAblation);
+  document.querySelectorAll('input[name="abl-method"]').forEach(r => {
+    r.addEventListener("change", () => {
+      const m = getAblMethod();
+      ablArditiPicker.style.display = (m === "arditi") ? "" : "none";
+      ablPirasPicker.style.display = (m === "piras") ? "" : "none";
+    });
+  });
+}
+
+function refreshDirectionDropdowns() {
+  const arditiSel = document.getElementById("abl-direction-arditi");
+  const curArditi = arditiSel.value;
+  arditiSel.innerHTML = "";
+  const arditiDirs = SERVER_STATE.directions.filter(d => d.kind === "mean_diff");
+  if (!arditiDirs.length) {
+    const opt = document.createElement("option");
+    opt.disabled = true; opt.selected = true; opt.textContent = "— no mean_diff directions yet —";
+    arditiSel.appendChild(opt);
+  } else {
+    for (const d of arditiDirs) {
+      const opt = document.createElement("option");
+      opt.value = d.layer_key;
+      opt.textContent = `${d.label} · norm ${d.raw_norm.toFixed(2)} · score ${d.normalized_score.toFixed(3)}`;
+      arditiSel.appendChild(opt);
+    }
+    if (curArditi) arditiSel.value = curArditi;
+  }
+
+  const pirasSel = document.getElementById("abl-direction-piras");
+  pirasSel.innerHTML = "";
+  const pirasDirs = SERVER_STATE.directions.filter(d => d.kind === "som_md" && d.layer_key.includes("_som_n"));
+  if (!pirasDirs.length) {
+    const opt = document.createElement("option");
+    opt.disabled = true; opt.selected = true; opt.textContent = "— no SOM neurons yet —";
+    pirasSel.appendChild(opt);
+  } else {
+    for (const d of pirasDirs) {
+      const opt = document.createElement("option");
+      opt.value = d.layer_key;
+      const cs = d.cluster_size != null ? ` · size ${d.cluster_size}` : "";
+      opt.textContent = `${d.label}${cs} · norm ${d.raw_norm.toFixed(2)}`;
+      pirasSel.appendChild(opt);
+    }
+  }
+
+  const cmpSel = document.getElementById("cmp-layers");
+  cmpSel.innerHTML = "";
+  for (const d of SERVER_STATE.directions) {
+    const opt = document.createElement("option");
+    opt.value = d.layer_key;
+    const tag = d.kind === "mean_diff" ? "[Arditi]" : "[SOM]";
+    opt.textContent = `${tag} ${d.label} · norm ${d.raw_norm.toFixed(2)}`;
+    cmpSel.appendChild(opt);
+  }
+  document.getElementById("cmp-cached-info").textContent =
+    SERVER_STATE.directions.length
+      ? `${SERVER_STATE.directions.length} cached directions across ${new Set(SERVER_STATE.directions.map(d=>d.layer)).size} layers`
+      : "No directions yet — visit Calibration tab first.";
+}
+
+async function runAblation() {
+  const status = document.getElementById("abl-status");
+  const method = getAblMethod();
+  let direction_layer, extra_direction_layers = [];
+  if (method === "arditi") {
+    const sel = document.getElementById("abl-direction-arditi");
+    if (!sel.value) { status.textContent = "no Arditi direction selected"; return; }
+    direction_layer = sel.value;
+  } else {
+    const sel = document.getElementById("abl-direction-piras");
+    const selected = Array.from(sel.selectedOptions).map(o => o.value);
+    if (selected.length === 0) { status.textContent = "select at least 1 SOM neuron"; return; }
+    const layers = new Set(selected.map(k => k.split("_som_n")[0]));
+    if (layers.size > 1) {
+      status.textContent = `error: SOM neurons must share layer (got ${[...layers].join(",")})`;
+      return;
+    }
+    direction_layer = selected[0];
+    extra_direction_layers = selected.slice(1);
+  }
+
+  status.textContent = "generating (baseline + ablated)...";
+  document.getElementById("abl-generate").disabled = true;
+  try {
+    const mode = document.querySelector('input[name="abl-mode"]:checked').value;
+    const body = {
+      prompt: document.getElementById("abl-prompt").value,
+      direction_layer, extra_direction_layers, mode,
+      strength: parseFloat(document.getElementById("abl-strength").value),
+      max_new_tokens: parseInt(document.getElementById("abl-max-tokens").value),
+      temperature: 0.7,
+    };
+    const r = await fetch("/ablation/generate", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    renderAblationResults(d, method);
+    status.textContent = `baseline ${d.elapsed_baseline_s}s · ablated ${d.elapsed_ablated_s}s`;
+  } catch (e) {
+    status.textContent = "error: " + e.message;
+  } finally {
+    document.getElementById("abl-generate").disabled = false;
+  }
+}
+
+function renderTokenChart(canvasId, prevChart, tokens, projs) {
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  if (prevChart) prevChart.destroy();
+  return new Chart(ctx, {
+    type: "bar",
+    data: { labels: tokens.map(t => JSON.stringify(t)),
+      datasets: [{ label: "projection", data: projs,
+        backgroundColor: projs.map(v => v > 0
+          ? `rgba(255,140,90,${Math.min(1, Math.abs(v)/2 + 0.2)})`
+          : `rgba(110,197,255,${Math.min(1, Math.abs(v)/2 + 0.2)})`),
+      }]},
+    options: { indexAxis: "y", responsive: true, animation: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { ticks: { font: { size: 10 } } }, y: { ticks: { font: { size: 9, family: "ui-monospace" } } } },
+    },
+  });
+}
+
+function renderAblationResults(d, method) {
+  document.getElementById("abl-results").style.display = "";
+  document.getElementById("abl-base-response").textContent = d.baseline_response || "(empty)";
+  document.getElementById("abl-abl-response").textContent = d.ablated_response || "(empty)";
+  document.getElementById("abl-base-time").textContent = `${d.elapsed_baseline_s}s`;
+  document.getElementById("abl-abl-time").textContent = `${d.elapsed_ablated_s}s`;
+  const methodTag = method === "arditi" ? "Arditi" : `Piras (k=${d.direction_labels.length})`;
+  document.getElementById("abl-mode-tag").textContent =
+    `${methodTag} · mode=${d.mode}${d.mode === "partial" ? " α=" + d.strength.toFixed(2) : ""} · ${d.direction_labels.join(" + ")}`;
+  baseChart = renderTokenChart("abl-base-chart", baseChart, d.baseline_tokens, d.baseline_token_projections);
+  ablChart = renderTokenChart("abl-abl-chart", ablChart, d.ablated_tokens, d.ablated_token_projections);
+}
+
+function initComparison() { document.getElementById("cmp-analyze").addEventListener("click", runComparison); }
+
+async function runComparison() {
+  const status = document.getElementById("cmp-status");
+  const sel = document.getElementById("cmp-layers");
+  const layers = Array.from(sel.selectedOptions).map(o => o.value);
+  if (layers.length < 2) { status.textContent = "select at least 2"; return; }
+  status.textContent = "analyzing...";
+  document.getElementById("cmp-analyze").disabled = true;
+  try {
+    const r = await fetch("/comparison/analyze", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ layers }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    renderComparisonResults(d);
+    status.textContent = `compared ${d.layers.length} directions`;
+  } catch (e) {
+    status.textContent = "error: " + e.message;
+  } finally {
+    document.getElementById("cmp-analyze").disabled = false;
+  }
+}
+
+function cosColor(v) {
+  if (v >= 0) {
+    const s = Math.min(1, v);
+    return `rgba(255, ${Math.round(255*(1-0.6*s))}, ${Math.round(255*(1-0.8*s))}, 0.9)`;
+  } else {
+    const s = Math.min(1, -v);
+    return `rgba(${Math.round(255*(1-0.8*s))}, ${Math.round(255*(1-0.6*s))}, 255, 0.9)`;
+  }
+}
+
+function renderComparisonResults(d) {
+  document.getElementById("cmp-results").style.display = "";
+  const tbl = document.getElementById("cmp-cos-table");
+  let h = `<thead><tr><th></th>`;
+  for (const l of d.labels) h += `<th class="text-center small-mono">${escapeHtml(l)}</th>`;
+  h += `</tr></thead><tbody>`;
+  for (let i = 0; i < d.labels.length; i++) {
+    h += `<tr><th class="small-mono">${escapeHtml(d.labels[i])}</th>`;
+    for (let j = 0; j < d.labels.length; j++) {
+      const v = d.cosine_matrix[i][j];
+      h += `<td class="cos-cell" style="background:${cosColor(v)}; color:#111;">${(i===j) ? "1.0000" : v.toFixed(4)}</td>`;
+    }
+    h += `</tr>`;
+  }
+  tbl.innerHTML = h + `</tbody>`;
+
+  const ctx = document.getElementById("cmp-norm-chart").getContext("2d");
+  if (normChart) normChart.destroy();
+  normChart = new Chart(ctx, {
+    type: "bar",
+    data: { labels: d.norms.map(n => n.label),
+      datasets: [
+        { label: "raw_norm", data: d.norms.map(n => n.raw_norm), backgroundColor: "rgba(110,197,255,0.7)" },
+        { label: "norm_score × 100", data: d.norms.map(n => n.normalized_score * 100), backgroundColor: "rgba(255,140,90,0.7)" },
+      ]},
+    options: { responsive: true, animation: false, plugins: { legend: { position: "bottom" } } },
+  });
+
+  let oh = `<thead><tr><th>Pair</th><th>Shared</th><th>Tokens</th></tr></thead><tbody>`;
+  for (const o of d.top_token_overlap) {
+    oh += `<tr><td class="small-mono">${escapeHtml(o.label_a)} ↔ ${escapeHtml(o.label_b)}</td><td class="kbd-num">${o.count}/10</td><td class="small-mono">${o.shared_tokens.map(t => escapeHtml(JSON.stringify(t))).join(", ") || "—"}</td></tr>`;
+  }
+  document.getElementById("cmp-overlap-table").innerHTML = oh + `</tbody>`;
+}
+
+(async function() {
+  initCalibration();
+  initAblation();
+  initComparison();
+  await fetchState();
+})();
+</script>
+</body>
+</html>
